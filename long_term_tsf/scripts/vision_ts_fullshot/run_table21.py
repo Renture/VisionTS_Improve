@@ -167,17 +167,29 @@ def train_job(dataset, horizon, seed, gpu, output, micro_batch):
                 best_epoch=best_epoch, validation_mse=best_loss)
 
 
-def worker(gpu, jobs, root, micro_batch):
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+def gpu_uuids(indices):
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+        check=True, stdout=subprocess.PIPE, text=True,
+    )
+    available = {index.strip(): uuid.strip() for index, uuid in csv.reader(result.stdout.splitlines())}
+    missing = [index for index in indices if index not in available]
+    if missing:
+        raise ValueError(f"GPU indices not found in nvidia-smi: {', '.join(missing)}")
+    return {index: available[index] for index in indices}
+
+
+def worker(gpu, gpu_uuid, jobs, root, micro_batch):
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_uuid
     os.environ["MPLBACKEND"] = "Agg"
     sys.path[:0] = [str(LTSF_DIR), str(LTSF_DIR.parent)]
 
     import torch
 
     torch.set_num_threads(1)
-    if not torch.cuda.is_available():
-        raise RuntimeError(f"CUDA unavailable for GPU {gpu}")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError(f"Expected one visible CUDA device for GPU {gpu} ({gpu_uuid})")
+    print(f"Physical GPU {gpu} ({gpu_uuid}) is worker cuda:0", flush=True)
     for dataset, horizon, seed in iter(jobs.get, None):
         output = root / dataset / str(horizon) / f"seed_{seed}"
         output.mkdir(parents=True)
@@ -225,7 +237,8 @@ def main():
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--micro-batch", type=int, default=32)
-    parser.add_argument("--gpus", nargs="+", default=["0", "1", "2", "3"])
+    parser.add_argument("--gpus", nargs="+", default=["2", "3"],
+                        help="Physical GPU indices shown by nvidia-smi (default: 2 3)")
     args = parser.parse_args()
     if args.micro_batch < 1 or args.micro_batch > BATCH_SIZE:
         parser.error(f"--micro-batch must be between 1 and {BATCH_SIZE}")
@@ -236,6 +249,10 @@ def main():
     missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
     if missing:
         parser.error("Missing or empty inputs:\n" + "\n".join(missing))
+    try:
+        devices = gpu_uuids(args.gpus)
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        parser.error(str(error))
 
     base = LTSF_DIR / "save" / "table21_fullshot"
     base.mkdir(parents=True, exist_ok=True)
@@ -244,7 +261,7 @@ def main():
              for horizon in DATASETS[dataset].horizons for seed in SEEDS[:args.repeats]]
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=LTSF_DIR, check=True,
                               stdout=subprocess.PIPE, text=True).stdout.strip()
-    manifest = dict(arguments=vars(args), commit=revision, checkpoint=str(CHECKPOINT),
+    manifest = dict(arguments=vars(args), gpu_uuids=devices, commit=revision, checkpoint=str(CHECKPOINT),
                     batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE, seeds=SEEDS[:args.repeats])
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Results: {root} ({len(tasks)} runs)", flush=True)
@@ -255,7 +272,7 @@ def main():
     priority = ("Traffic", "Electricity", "Weather", "ETTm1", "ETTm2", "ETTh1", "ETTh2", "Illness")
     for task in sorted(tasks, key=lambda item: priority.index(item[0])):
         jobs.put(task)
-    processes = [context.Process(target=worker, args=(gpu, jobs, root, args.micro_batch))
+    processes = [context.Process(target=worker, args=(gpu, devices[gpu], jobs, root, args.micro_batch))
                  for gpu in args.gpus[:len(tasks)]]
     for process in processes:
         jobs.put(None)
