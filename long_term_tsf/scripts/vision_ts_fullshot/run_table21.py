@@ -74,7 +74,7 @@ class SeriesWindows:
                 torch.from_numpy(future).to(device).unsqueeze(-1))
 
 
-def evaluate(model, windows, device, batch_size):
+def evaluate(model, windows, device, batch_size, progress, description):
     import numpy as np
     import torch
 
@@ -82,7 +82,7 @@ def evaluate(model, windows, device, batch_size):
     squared = torch.zeros((), device=device, dtype=torch.float64)
     absolute = torch.zeros_like(squared)
     with torch.no_grad():
-        for start in range(0, windows.count, batch_size):
+        for start in progress(range(0, windows.count, batch_size), desc=description):
             indices = np.arange(start, min(start + batch_size, windows.count))
             history, future = windows.take(indices, device)
             error = model(history) - future
@@ -95,7 +95,7 @@ def evaluate(model, windows, device, batch_size):
     return mse, mae
 
 
-def train_job(dataset, horizon, seed, gpu, output, micro_batch):
+def train_job(dataset, horizon, seed, gpu, output, micro_batch, progress):
     import numpy as np
     import torch
     from torch.nn import functional as F
@@ -130,12 +130,14 @@ def train_job(dataset, horizon, seed, gpu, output, micro_batch):
     best_loss, best_epoch, best_state = float("inf"), 0, None
     train = splits["train"]
     eval_batch = max(micro_batch, 64)
+    label = f"GPU {gpu} {dataset}/{horizon} seed={seed}"
 
     for epoch in range(1, spec.epochs + 1):
         model.train()
         order = rng.permutation(train.count)
         epoch_loss = torch.zeros((), device=device, dtype=torch.float64)
-        for step, start in enumerate(range(0, train.count, BATCH_SIZE), 1):
+        batches = progress(range(0, train.count, BATCH_SIZE), desc=f"{label} train {epoch}/{spec.epochs}")
+        for step, start in enumerate(batches, 1):
             batch = order[start:start + BATCH_SIZE]
             optimizer.zero_grad()
             for offset in range(0, len(batch), micro_batch):
@@ -147,7 +149,7 @@ def train_job(dataset, horizon, seed, gpu, output, micro_batch):
             if step % 500 == 0:
                 print(f"Epoch {epoch}, optimizer steps: {step}", flush=True)
 
-        valid_loss, _ = evaluate(model, splits["val"], device, eval_batch)
+        valid_loss, _ = evaluate(model, splits["val"], device, eval_batch, progress, f"{label} val {epoch}")
         print(f"Epoch {epoch}: train MSE={epoch_loss.item() / (train.count * horizon):.6f}, "
               f"validation MSE={valid_loss:.6f}")
         if valid_loss <= best_loss:
@@ -160,7 +162,7 @@ def train_job(dataset, horizon, seed, gpu, output, micro_batch):
     with torch.no_grad():
         for name, param in trainable.items():
             param.copy_(best_state[name])
-    mse, mae = evaluate(model, splits["test"], device, eval_batch)
+    mse, mae = evaluate(model, splits["test"], device, eval_batch, progress, f"{label} test")
     torch.save(best_state, output / "layernorm.pt")
     print(f"Test MSE={mse:.6f}, MAE={mae:.6f}, best epoch={best_epoch}")
     return dict(dataset=dataset, horizon=horizon, seed=seed, gpu=gpu, mse=mse, mae=mae,
@@ -179,12 +181,19 @@ def gpu_uuids(indices):
     return {index: available[index] for index in indices}
 
 
-def worker(gpu, gpu_uuid, jobs, root, micro_batch):
+def worker(gpu, gpu_uuid, jobs, root, micro_batch, position, progress_lock):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_uuid
     os.environ["MPLBACKEND"] = "Agg"
     sys.path[:0] = [str(LTSF_DIR), str(LTSF_DIR.parent)]
 
     import torch
+    from tqdm import tqdm
+
+    tqdm.set_lock(progress_lock)
+
+    def progress(batches, desc):
+        return tqdm(batches, desc=desc, position=position, leave=False, dynamic_ncols=True,
+                    mininterval=1, file=sys.__stderr__, disable=not sys.__stderr__.isatty())
 
     torch.set_num_threads(1)
     if torch.cuda.device_count() != 1:
@@ -193,14 +202,14 @@ def worker(gpu, gpu_uuid, jobs, root, micro_batch):
     for dataset, horizon, seed in iter(jobs.get, None):
         output = root / dataset / str(horizon) / f"seed_{seed}"
         output.mkdir(parents=True)
-        print(f"GPU {gpu}: {dataset} H={horizon} seed={seed}", flush=True)
+        tqdm.write(f"GPU {gpu}: {dataset} H={horizon} seed={seed}", file=sys.__stderr__)
         with (output / "run.log").open("w", buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
             try:
-                metrics = train_job(dataset, horizon, seed, gpu, output, micro_batch)
+                metrics = train_job(dataset, horizon, seed, gpu, output, micro_batch, progress)
                 (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
             except Exception:
                 traceback.print_exc()
-                print(f"Failed: {output / 'run.log'}", file=sys.__stderr__, flush=True)
+                tqdm.write(f"Failed: {output / 'run.log'}", file=sys.__stderr__)
         torch.cuda.empty_cache()
 
 
@@ -272,8 +281,10 @@ def main():
     priority = ("Traffic", "Electricity", "Weather", "ETTm1", "ETTm2", "ETTh1", "ETTh2", "Illness")
     for task in sorted(tasks, key=lambda item: priority.index(item[0])):
         jobs.put(task)
-    processes = [context.Process(target=worker, args=(gpu, devices[gpu], jobs, root, args.micro_batch))
-                 for gpu in args.gpus[:len(tasks)]]
+    progress_lock = context.RLock()
+    processes = [context.Process(target=worker, args=(gpu, devices[gpu], jobs, root, args.micro_batch,
+                                                     position, progress_lock))
+                 for position, gpu in enumerate(args.gpus[:len(tasks)])]
     for process in processes:
         jobs.put(None)
         process.start()
