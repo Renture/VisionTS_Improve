@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import math
 import multiprocessing as mp
 import os
 import statistics
@@ -201,27 +202,47 @@ def worker(gpu, gpu_uuid, jobs, root, micro_batch, position, progress_lock):
     print(f"Physical GPU {gpu} ({gpu_uuid}) is worker cuda:0", flush=True)
     for dataset, horizon, seed in iter(jobs.get, None):
         output = root / dataset / str(horizon) / f"seed_{seed}"
-        output.mkdir(parents=True)
+        output.mkdir(parents=True, exist_ok=True)
         tqdm.write(f"GPU {gpu}: {dataset} H={horizon} seed={seed}", file=sys.__stderr__)
-        with (output / "run.log").open("w", buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
+        with (output / "run.log").open("a", buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
             try:
+                print(f"Starting {dataset} H={horizon} seed={seed} on physical GPU {gpu}", flush=True)
                 metrics = train_job(dataset, horizon, seed, gpu, output, micro_batch, progress)
-                (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+                temporary = output / "metrics.json.tmp"
+                temporary.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(output / "metrics.json")
             except Exception:
                 traceback.print_exc()
                 tqdm.write(f"Failed: {output / 'run.log'}", file=sys.__stderr__)
         torch.cuda.empty_cache()
 
 
+def completed_result(root, task):
+    dataset, horizon, seed = task
+    directory = root / dataset / str(horizon) / f"seed_{seed}"
+    path = directory / "metrics.json"
+    weights = directory / "layernorm.pt"
+    if not path.is_file() or not weights.is_file() or weights.stat().st_size == 0:
+        return None
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+        if (row["dataset"], row["horizon"], row["seed"]) == task and all(
+            math.isfinite(row[key]) for key in ("mse", "mae", "validation_mse")
+        ):
+            return row
+    except (ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
 def write_summary(root, tasks, repeats):
     runs = []
     groups = {}
-    for dataset, horizon, seed in tasks:
-        path = root / dataset / str(horizon) / f"seed_{seed}" / "metrics.json"
-        if path.is_file():
-            row = json.loads(path.read_text(encoding="utf-8"))
+    for task in tasks:
+        row = completed_result(root, task)
+        if row is not None:
             runs.append(row)
-            groups.setdefault((dataset, horizon), []).append(row)
+            groups.setdefault(task[:2], []).append(row)
 
     fields = ("dataset", "horizon", "seed", "gpu", "mse", "mae", "best_epoch", "validation_mse")
     with (root / "runs.csv").open("w", newline="", encoding="utf-8") as file:
@@ -248,6 +269,8 @@ def main():
     parser.add_argument("--micro-batch", type=int, default=32)
     parser.add_argument("--gpus", nargs="+", default=["2", "3"],
                         help="Physical GPU indices shown by nvidia-smi (default: 2 3)")
+    parser.add_argument("--resume", type=Path,
+                        help="Existing run directory. Retry unfinished tasks and reuse completed results.")
     args = parser.parse_args()
     if args.micro_batch < 1 or args.micro_batch > BATCH_SIZE:
         parser.error(f"--micro-batch must be between 1 and {BATCH_SIZE}")
@@ -258,33 +281,59 @@ def main():
     missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
     if missing:
         parser.error("Missing or empty inputs:\n" + "\n".join(missing))
+    tasks = [(dataset, horizon, seed) for dataset in datasets
+             for horizon in DATASETS[dataset].horizons for seed in SEEDS[:args.repeats]]
+    pending = tasks
+    if args.resume is not None:
+        root = args.resume.resolve()
+        try:
+            original = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            original_args = original["arguments"]
+            if (set(original_args["datasets"]) != set(datasets)
+                    or original_args["repeats"] != args.repeats
+                    or original_args["micro_batch"] != args.micro_batch
+                    or original["batch_size"] != BATCH_SIZE
+                    or original["learning_rate"] != LEARNING_RATE
+                    or original["seeds"] != list(SEEDS[:args.repeats])
+                    or original["checkpoint"] != str(CHECKPOINT)):
+                raise ValueError("Resume with the original datasets, repeats, micro-batch and weights")
+        except (OSError, KeyError, ValueError) as error:
+            parser.error(f"Cannot resume {root}: {error}")
+        pending = [task for task in tasks if completed_result(root, task) is None]
+        print(f"Resuming {root}: {len(tasks) - len(pending)} complete, {len(pending)} pending", flush=True)
+        if not pending:
+            write_summary(root, tasks, args.repeats)
+            return 0
+
     try:
         devices = gpu_uuids(args.gpus)
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         parser.error(str(error))
 
-    base = LTSF_DIR / "save" / "table21_fullshot"
-    base.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="run.", dir=base))
-    tasks = [(dataset, horizon, seed) for dataset in datasets
-             for horizon in DATASETS[dataset].horizons for seed in SEEDS[:args.repeats]]
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=LTSF_DIR, check=True,
                               stdout=subprocess.PIPE, text=True).stdout.strip()
-    manifest = dict(arguments=vars(args), gpu_uuids=devices, commit=revision, checkpoint=str(CHECKPOINT),
-                    batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE, seeds=SEEDS[:args.repeats])
-    (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    if args.resume is None:
+        base = LTSF_DIR / "save" / "table21_fullshot"
+        base.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="run.", dir=base))
+        manifest = dict(arguments=vars(args), gpu_uuids=devices, commit=revision, checkpoint=str(CHECKPOINT),
+                        batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE, seeds=SEEDS[:args.repeats])
+        (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    else:
+        with (root / "resume.log").open("a", encoding="utf-8") as log:
+            print(f"Commit {revision}: {len(pending)} pending, GPUs {devices}", file=log)
     print(f"Results: {root} ({len(tasks)} runs)", flush=True)
 
     context = mp.get_context("spawn")
     jobs = context.Queue()
     # Start the largest workloads early to reduce the time the other GPUs sit idle.
     priority = ("Traffic", "Electricity", "Weather", "ETTm1", "ETTm2", "ETTh1", "ETTh2", "Illness")
-    for task in sorted(tasks, key=lambda item: priority.index(item[0])):
+    for task in sorted(pending, key=lambda item: priority.index(item[0])):
         jobs.put(task)
     progress_lock = context.RLock()
     processes = [context.Process(target=worker, args=(gpu, devices[gpu], jobs, root, args.micro_batch,
                                                      position, progress_lock))
-                 for position, gpu in enumerate(args.gpus[:len(tasks)])]
+                 for position, gpu in enumerate(args.gpus[:len(pending)])]
     for process in processes:
         jobs.put(None)
         process.start()
