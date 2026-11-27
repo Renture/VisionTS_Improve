@@ -326,8 +326,8 @@ def main():
 
     context = mp.get_context("spawn")
     jobs = context.Queue()
-    # Start the largest workloads early to reduce the time the other GPUs sit idle.
-    priority = ("Traffic", "Electricity", "Weather", "ETTm1", "ETTm2", "ETTh1", "ETTh2", "Illness")
+    # Queue smaller datasets first so their results are available before Traffic.
+    priority = ("ETTh1", "ETTh2", "Illness", "ETTm1", "ETTm2", "Weather", "Electricity", "Traffic")
     for task in sorted(pending, key=lambda item: priority.index(item[0])):
         jobs.put(task)
     progress_lock = context.RLock()
